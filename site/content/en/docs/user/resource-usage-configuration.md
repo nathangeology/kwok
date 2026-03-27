@@ -69,6 +69,50 @@ expression: 'Quantity("1Mi") * (pod.SinceSecond() / 60.0)'
 ```
 Please refer to [CEL expressions in `kwok`][CEL expressions] for an exhausted list that may be helpful to configure dynamic resource usage.
 
+### Startup Spike Pattern
+
+Some workloads consume significantly more resources during startup than at steady state.
+For example, JVM applications spike CPU during class loading and JIT compilation, and ML serving pods spike during model loading.
+CEL expressions can model this pattern.
+
+**Step-function variant** — full power for the first 60 seconds, then drop to steady state:
+
+```yaml
+usage:
+  cpu:
+    expression: 'pod.SinceSecond() < 60 ? Quantity("2000m") : Quantity("500m")'
+```
+
+**Smooth decay variant** — high initial usage that gradually tapers off:
+
+```yaml
+usage:
+  cpu:
+    expression: 'Quantity("500m") + Quantity("1500m") * (1.0 / (1.0 + pod.SinceSecond() / 30.0))'
+```
+
+This starts near 2000m and decays toward 500m with a 30-second half-life.
+
+**Per-container example** — apply the spike only to the application container while a sidecar stays constant:
+
+```yaml
+usages:
+- containers:
+  - app
+  usage:
+    cpu:
+      expression: 'pod.SinceSecond() < 60 ? Quantity("2000m") : Quantity("500m")'
+    memory:
+      expression: 'pod.SinceSecond() < 120 ? Quantity("2Gi") : Quantity("512Mi")'
+- containers:
+  - sidecar
+  usage:
+    cpu:
+      value: "100m"
+    memory:
+      value: "64Mi"
+```
+
 ### ClusterResourceUsage
 
 In addition to simulating a single pod, users can also simulate the resource usage for multiple pods via [ClusterResourceUsage].
