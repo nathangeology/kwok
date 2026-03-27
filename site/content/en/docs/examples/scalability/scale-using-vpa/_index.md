@@ -181,9 +181,118 @@ After deleting the cluster, you should close the terminal, or else the VPA
 components deployed may keep trying to communicate
 to the API server, resulting in several error outputs.
 
+## Time-varying usage: JVM warm-up pattern
+
+The previous example uses static resource usage. With [CEL expressions], you can
+simulate dynamic patterns — for example, a JVM application whose CPU usage starts
+high during JIT compilation and decays toward a steady state.
+
+### Create the cluster with time-varying usage
+
+```bash
+kwokctl create cluster --enable-metrics-server \
+  --config ./metrics-usage.yaml \
+  --config cluster-resource-usage-jvm.yaml \
+  --runtime binary
+```
+
+The `cluster-resource-usage-jvm.yaml` config uses `ClusterResourceUsage` with CEL
+expressions that change over time:
+
+{{< expand "cluster-resource-usage-jvm.yaml" >}}
+
+{{< code-sample file="cluster-resource-usage-jvm.yaml" >}}
+
+{{< /expand >}}
+
+- **CPU**: starts at ~200m and linearly decays to 10m over 5 minutes
+  (`pod.SinceSecond()` drives the decay).
+- **Memory**: ramps from 50Mi to 200Mi over 2 minutes, then holds steady.
+
+### Deploy the application and node
+
+```bash
+kwokctl scale node --replicas 1 --param '.allocatable.cpu="4000m"'
+kubectl apply -f deployment.yaml
+```
+
+### Observe metrics changing over time
+
+Shortly after the pods start (within ~30 seconds):
+
+```bash
+kubectl top pods
+
+NAME                        CPU(cores)   MEMORY(bytes)
+fake-app-6df6bf5469-abc12   190m         85Mi
+fake-app-6df6bf5469-def34   185m         80Mi
+```
+
+After about 3 minutes:
+
+```bash
+kubectl top pods
+
+NAME                        CPU(cores)   MEMORY(bytes)
+fake-app-6df6bf5469-abc12   90m          200Mi
+fake-app-6df6bf5469-def34   85m          200Mi
+```
+
+After 5 minutes (steady state):
+
+```bash
+kubectl top pods
+
+NAME                        CPU(cores)   MEMORY(bytes)
+fake-app-6df6bf5469-abc12   10m          200Mi
+fake-app-6df6bf5469-def34   10m          200Mi
+```
+
+### VPA detects the drop
+
+Set up VPA as described in the [previous section](#set-up-vpa), then create the VPA
+resource and wait for a recommendation:
+
+```bash
+kubectl apply -f vpa.yaml
+kubectl wait --for=condition=RecommendationProvided=true vpa/fake-vpa --timeout=300s
+```
+
+Once the VPA recommender observes the decaying CPU usage, it adjusts its
+recommendations downward:
+
+```bash
+kubectl describe vpa fake-vpa | awk '/Recommendation:/,/Events:/' | sed '$d'
+
+Recommendation:
+  Container Recommendations:
+    Container Name:  fake-container
+    Lower Bound:
+      Cpu:     10m
+      Memory:  200Mi
+    Target:
+      Cpu:     10m
+      Memory:  200Mi
+    Upper Bound:
+      Cpu:     200m
+      Memory:  200Mi
+```
+
+The target CPU recommendation drops to match the steady-state usage, demonstrating
+that VPA correctly tracks time-varying resource consumption simulated by KWOK.
+
+### Clean up
+
+```bash
+kwokctl delete cluster
+```
+
 ## Conclusion
 
 This example demonstrates how to use KWOK to simulate [vertical
-pod autoscaling](https://github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler).
+pod autoscaling](https://github.com/kubernetes-sigs/cluster-proportional-vertical-autoscaler),
+including time-varying resource usage patterns driven by CEL expressions.
 
 Other VPA modes can also be simulated.
+
+[CEL expressions]: {{< relref "/docs/user/cel-expressions" >}}
