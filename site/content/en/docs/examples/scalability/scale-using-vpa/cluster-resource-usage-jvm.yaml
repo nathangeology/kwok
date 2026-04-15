@@ -1,0 +1,24 @@
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: ClusterResourceUsage
+metadata:
+  name: jvm-decay-usage
+spec:
+  selector:
+    matchNamespaces:
+    - default
+  usages:
+  - containers:
+    - fake-container
+    usage:
+      cpu:
+        # JVM pattern: starts at ~200m (JIT compilation), decays to 10m over 5 minutes
+        expression: |
+          pod.SinceSecond() < 300.0
+          ? Quantity("200m") * (1.0 - pod.SinceSecond() / 300.0) + Quantity("10m")
+          : Quantity("10m")
+      memory:
+        # Memory climbs during class loading, levels off at ~200Mi after 2 minutes
+        expression: |
+          pod.SinceSecond() < 120.0
+          ? Quantity("50Mi") + Quantity("150Mi") * (pod.SinceSecond() / 120.0)
+          : Quantity("200Mi")
