@@ -19,6 +19,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 
@@ -82,8 +83,14 @@ func (s *Server) InstallMetrics(ctx context.Context) error {
 			if !strings.HasPrefix(m.Spec.Path, rootPath) {
 				return fmt.Errorf("metric path %q does not start with %q", m.Spec.Path, rootPath)
 			}
-			ws.Route(ws.GET(strings.TrimPrefix(m.Spec.Path, rootPath)).
-				To(s.getMetrics(m, s.env)))
+			path := strings.TrimPrefix(m.Spec.Path, rootPath)
+			ws.Route(ws.GET(path).To(s.getMetrics(m, s.env)))
+
+			// Register a flat route for metrics-server compatibility.
+			// e.g. /nodes/{nodeName}/metrics/resource → /resource
+			if flat, ok := flatMetricsPath(path); ok {
+				ws.Route(ws.GET(flat).To(s.getMetrics(m, s.env)))
+			}
 		}
 	}
 
@@ -102,15 +109,24 @@ func (s *Server) dynamicMetricsPath(ctx context.Context, ws *restful.WebService,
 			}
 
 			path := strings.TrimPrefix(m.Spec.Path, rootPath)
-			newHasPaths[path] = struct{}{}
-			if _, ok := hasPaths[path]; ok {
-				err := ws.RemoveRoute(http.MethodGet, path)
-				if err != nil {
-					logger.Error("Failed to remove route", err, "path", path)
-				}
+			handler := s.getMetrics(m, s.env)
+
+			// Collect all paths to register for this metric.
+			paths := []string{path}
+			if flat, ok := flatMetricsPath(path); ok {
+				paths = append(paths, flat)
 			}
-			ws.Route(ws.GET(path).
-				To(s.getMetrics(m, s.env)))
+
+			for _, p := range paths {
+				newHasPaths[p] = struct{}{}
+				if _, ok := hasPaths[p]; ok {
+					err := ws.RemoveRoute(http.MethodGet, p)
+					if err != nil {
+						logger.Error("Failed to remove route", err, "path", p)
+					}
+				}
+				ws.Route(ws.GET(p).To(handler))
+			}
 		}
 
 		for path := range hasPaths {
@@ -126,11 +142,63 @@ func (s *Server) dynamicMetricsPath(ctx context.Context, ws *restful.WebService,
 	}
 }
 
+// resolveNodeName attempts to determine the target node name from the request.
+// It checks the Host header against known node names and addresses.
+func (s *Server) resolveNodeName(req *http.Request) string {
+	host := req.Host
+	// Strip port if present.
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+
+	// Check if the host matches a known node name directly.
+	if _, ok := s.nodeCacheGetter.Get(host); ok {
+		return host
+	}
+
+	// Check if the host IP matches a node's address.
+	for _, nodeName := range s.dataSource.ListNodes() {
+		node, ok := s.nodeCacheGetter.Get(nodeName)
+		if !ok {
+			continue
+		}
+		for _, addr := range node.Status.Addresses {
+			if addr.Address == host {
+				return nodeName
+			}
+		}
+	}
+
+	return ""
+}
+
+// flatMetricsPath returns the path with /nodes/{nodeName} segments removed,
+// e.g. "/nodes/{nodeName}/metrics/resource" becomes "/resource".
+func flatMetricsPath(path string) (string, bool) {
+	const segment = "/nodes/{nodeName}"
+	idx := strings.Index(path, segment)
+	if idx < 0 {
+		return "", false
+	}
+	return path[:idx] + path[idx+len(segment):], true
+}
+
 func (s *Server) getMetrics(metric *internalversion.Metric, env *metrics.Environment) func(req *restful.Request, resp *restful.Response) {
 	return func(req *restful.Request, resp *restful.Response) {
 		nodeName := req.PathParameter("nodeName")
 		if nodeName == "" {
-			nodeName = metric.Name
+			nodeName = s.resolveNodeName(req.Request)
+		}
+		if nodeName == "" {
+			// Fallback: use the first node if only one exists.
+			nodes := s.dataSource.ListNodes()
+			if len(nodes) == 1 {
+				nodeName = nodes[0]
+			}
+		}
+		if nodeName == "" {
+			resp.WriteHeader(http.StatusNotFound)
+			return
 		}
 
 		handler, ok := s.metricsUpdateHandler.Load(nodeName)
